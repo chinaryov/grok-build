@@ -17,10 +17,11 @@ checks:
         fail() { echo "ledger: FAIL: $*" >&2; exit 1; }
         # The candidate commit: HEAD in a clean checkout, else a throwaway
         # commit of the working tree on top of HEAD (no ref or index changes).
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
         if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
           cand=$(git rev-parse HEAD)
         else
-          idx=$(mktemp); trap 'rm -f "$idx"' EXIT
+          idx="$tmp/index"
           GIT_INDEX_FILE="$idx" git read-tree HEAD
           GIT_INDEX_FILE="$idx" git add -A
           cand=$(git commit-tree -p HEAD -m "rh-gate candidate" "$(GIT_INDEX_FILE="$idx" git write-tree)")
@@ -52,15 +53,26 @@ checks:
         git merge-base --is-ancestor "$base" "$cand" || fail "base $base is not an ancestor of HEAD"
 
         # 3. Only the fork's own files and the ledger's files differ from the base.
-        allowed=$(printf '%s\n' RH-PATCHES.md .reviewherd.yaml
-          printf '%s\n' "$ledger" | sed -n 's/^- file: `\([^`]*\)` *$/\1/p')
+        # Each changed path (NUL-delimited, whole) must equal an allowed entry
+        # exactly: a set lookup, no pattern matching. A ledger line cannot hold
+        # a newline, so a path with one is never listed and is named as such.
+        declare -A allowed=([RH-PATCHES.md]=1 [.reviewherd.yaml]=1)
+        while IFS= read -r entry; do
+          [ -n "$entry" ] || fail "RH-PATCHES.md has an empty '- file:' entry"
+          allowed["$entry"]=1
+        done < <(printf '%s\n' "$ledger" | sed -n 's/^- file: `\([^`]*\)` *$/\1/p')
+        git diff --name-only --no-renames -z "$base" "$cand" >"$tmp/changed" \
+          || fail "cannot list the files changed against $base"
         bad=0
         while IFS= read -r -d '' f; do
-          if ! printf '%s\n' "$allowed" | grep -qxF -- "$f"; then
-            echo "ledger: not in RH-PATCHES.md: $f" >&2
+          if [[ "$f" == *$'\n'* ]]; then
+            echo "ledger: a file name with a newline cannot be listed in RH-PATCHES.md: $(printf '%q' "$f")" >&2
+            bad=1
+          elif [ -z "${allowed["$f"]+set}" ]; then
+            echo "ledger: not in RH-PATCHES.md: $(printf '%q' "$f")" >&2
             bad=1
           fi
-        done < <(git diff --name-only --no-renames -z "$base" "$cand")
+        done <"$tmp/changed"
         [ "$bad" = 0 ] || fail "files changed against upstream $version ($base) that no patch lists"
         echo "ledger: OK (upstream $version $base)"
         RH_GATE_SCRIPT
@@ -78,33 +90,55 @@ checks:
         fi
         # The candidate commit: HEAD in a clean checkout, else a throwaway
         # commit of the working tree on top of HEAD (no ref or index changes).
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
         if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
           cand=$(git rev-parse HEAD)
         else
-          idx=$(mktemp); trap 'rm -f "$idx"' EXIT
+          idx="$tmp/index"
           GIT_INDEX_FILE="$idx" git read-tree HEAD
           GIT_INDEX_FILE="$idx" git add -A
           cand=$(git commit-tree -p HEAD -m "rh-gate candidate" "$(GIT_INDEX_FILE="$idx" git write-tree)")
         fi
         base=$(git show "$cand":RH-PATCHES.md | sed -n 's/^Upstream base: *[^ ]* *\([0-9a-f]\{40\}\) *$/\1/p' | head -n1)
         [ -n "$base" ] || { echo "fmt: FAIL: no 'Upstream base:' commit in RH-PATCHES.md" >&2; exit 1; }
-        # The crates touched against the upstream base: the nearest Cargo.toml
-        # under crates/ of each changed file that still exists.
-        pkgs=$(git diff --name-only --no-renames -z "$base" "$cand" | while IFS= read -r -d '' f; do
-          case "$f" in crates/*) ;; *) continue ;; esac
-          [ -e "$f" ] || continue
-          d=$(dirname "$f")
-          while [ "$d" != crates ] && [ "$d" != . ] && [ ! -f "$d/Cargo.toml" ]; do d=$(dirname "$d"); done
-          if [ -f "$d/Cargo.toml" ]; then
-            sed -n 's/^name *= *"\(.*\)"/\1/p' "$d/Cargo.toml" | head -n1
+        command -v jq >/dev/null 2>&1 || { echo "fmt: FAIL: jq is needed to read cargo metadata" >&2; exit 1; }
+        # The packages touched against the upstream base. Cargo lists every
+        # workspace member (crates/, prod/, third_party/, ...); each changed
+        # path, deleted ones included, belongs to the member whose directory
+        # holds it most deeply. Paths stay NUL-delimited end to end.
+        top=$(cd "$(git rev-parse --show-toplevel)" && pwd -P)
+        cargo metadata --no-deps --offline --format-version 1 --manifest-path "$top/Cargo.toml" >"$tmp/metadata"
+        ws=$(jq -j '.workspace_root' "$tmp/metadata")
+        [ "$(cd "$ws" && pwd -P)" = "$top" ] \
+          || { echo "fmt: FAIL: the cargo workspace root '$ws' is not the repository root '$top'" >&2; exit 1; }
+        jq -j '.workspace_root as $r | .packages[]
+          | .name, "\u0000", (.manifest_path | ltrimstr($r + "/") | rtrimstr("Cargo.toml")), "\u0000"' \
+          "$tmp/metadata" >"$tmp/packages"
+        names=(); dirs=()
+        while IFS= read -r -d '' name && IFS= read -r -d '' dir; do
+          names+=("$name"); dirs+=("$dir")
+        done <"$tmp/packages"
+        [ "${#names[@]}" -gt 0 ] || { echo "fmt: FAIL: cargo metadata lists no workspace package" >&2; exit 1; }
+        git diff --name-only --no-renames -z "$base" "$cand" >"$tmp/changed"
+        declare -A touched=()
+        while IFS= read -r -d '' f; do
+          best=-1
+          for i in "${!dirs[@]}"; do
+            d=${dirs[$i]}
+            if [[ "$f" == "$d"* ]] && { [ "$best" -lt 0 ] || [ "${#d}" -gt "${#dirs[$best]}" ]; }; then best=$i; fi
+          done
+          if [ "$best" -ge 0 ]; then
+            touched["${names[$best]}"]=1
+          elif [[ "$f" == *.rs ]] && [ -e "$f" ]; then
+            echo "fmt: not in a workspace package, not checked: $(printf '%q' "$f")"
           fi
-        done | sort -u)
-        if [ -z "$pkgs" ]; then
-          echo "fmt: no crate touched against upstream $base"
+        done <"$tmp/changed"
+        if [ "${#touched[@]}" -eq 0 ]; then
+          echo "fmt: no workspace package touched against upstream $base"
           exit 0
         fi
         args=()
-        for p in $pkgs; do args+=(-p "$p"); done
+        while IFS= read -r p; do args+=(-p "$p"); done < <(printf '%s\n' "${!touched[@]}" | sort)
         echo "fmt: cargo fmt --check ${args[*]}"
         cargo fmt --check "${args[@]}"
         RH_GATE_SCRIPT
