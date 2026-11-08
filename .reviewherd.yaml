@@ -1,0 +1,145 @@
+# ReviewHerd gate of the grok-build fork (agent-herd plan row ACP-14).
+# The ledger is RH-PATCHES.md. Both checks read the base from its
+# "Upstream base: <version> <commit>" line at HEAD, never from rh/main:
+# in a PR checkout rh/main still names the landed branch.
+# Each cmd writes its script to a temp file and runs it with bash, whatever
+# shell runs cmd (the scripts use arrays, [[ ]] and process substitution).
+checks:
+  fail_fast: false
+  items:
+    - name: ledger
+      timeout_ms: 300000
+      cmd: |
+        f=$(mktemp) || exit 1
+        cat > "$f" <<'RH_GATE_SCRIPT'
+        set -euo pipefail
+        upstream_url="${RH_UPSTREAM_URL:-https://github.com/xai-org/grok-build.git}"
+        fail() { echo "ledger: FAIL: $*" >&2; exit 1; }
+        # The candidate commit: HEAD in a clean checkout, else a throwaway
+        # commit of the working tree on top of HEAD (no ref or index changes).
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
+          cand=$(git rev-parse HEAD)
+        else
+          idx="$tmp/index"
+          GIT_INDEX_FILE="$idx" git read-tree HEAD
+          GIT_INDEX_FILE="$idx" git add -A
+          cand=$(git commit-tree -p HEAD -m "rh-gate candidate" "$(GIT_INDEX_FILE="$idx" git write-tree)")
+        fi
+
+        ledger=$(git show "$cand":RH-PATCHES.md) || fail "RH-PATCHES.md is missing at the candidate commit"
+        base_line=$(printf '%s\n' "$ledger" | grep -E '^Upstream base:' || true)
+        [ "$(printf '%s\n' "$base_line" | grep -c .)" = 1 ] \
+          || fail "RH-PATCHES.md needs exactly one 'Upstream base: <version> <commit>' line"
+        read -r _ _ version base extra <<<"$base_line"
+        [ -n "$version" ] && [ -z "${extra:-}" ] || fail "bad base line: $base_line"
+        [[ "$base" =~ ^[0-9a-f]{40}$ ]] || fail "base commit must be a full 40-hex sha: '$base'"
+
+        # 1. The recorded base is the upstream commit of that version:
+        # on upstream main, and its version file says the recorded version.
+        # Fetched into FETCH_HEAD only: the gate writes no shared ref.
+        git fetch --quiet --no-tags "$upstream_url" refs/heads/main \
+          || fail "cannot fetch upstream main from $upstream_url"
+        upstream_main=$(git rev-parse --verify FETCH_HEAD^{commit})
+        git cat-file -e "$base^{commit}" 2>/dev/null || fail "base $base is not a commit in this repository"
+        git merge-base --is-ancestor "$base" "$upstream_main" \
+          || fail "base $base is not on upstream main ($upstream_url)"
+        base_version=$(git show "$base:crates/codegen/xai-grok-version/Cargo.toml" \
+          | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -n1)
+        [ "$base_version" = "$version" ] \
+          || fail "base $base has version '$base_version', the ledger records '$version'"
+
+        # 2. The base is an ancestor of HEAD.
+        git merge-base --is-ancestor "$base" "$cand" || fail "base $base is not an ancestor of HEAD"
+
+        # 3. Only the fork's own files and the ledger's files differ from the base.
+        # Each changed path (NUL-delimited, whole) must equal an allowed entry
+        # exactly: a set lookup, no pattern matching. A ledger line cannot hold
+        # a newline, so a path with one is never listed and is named as such.
+        declare -A allowed=([RH-PATCHES.md]=1 [.reviewherd.yaml]=1)
+        while IFS= read -r entry; do
+          [ -n "$entry" ] || fail "RH-PATCHES.md has an empty '- file:' entry"
+          allowed["$entry"]=1
+        done < <(printf '%s\n' "$ledger" | sed -n 's/^- file: `\([^`]*\)` *$/\1/p')
+        git diff --name-only --no-renames -z "$base" "$cand" >"$tmp/changed" \
+          || fail "cannot list the files changed against $base"
+        bad=0
+        while IFS= read -r -d '' f; do
+          if [[ "$f" == *$'\n'* ]]; then
+            echo "ledger: a file name with a newline cannot be listed in RH-PATCHES.md: $(printf '%q' "$f")" >&2
+            bad=1
+          elif [ -z "${allowed["$f"]+set}" ]; then
+            echo "ledger: not in RH-PATCHES.md: $(printf '%q' "$f")" >&2
+            bad=1
+          fi
+        done <"$tmp/changed"
+        [ "$bad" = 0 ] || fail "files changed against upstream $version ($base) that no patch lists"
+        echo "ledger: OK (upstream $version $base)"
+        RH_GATE_SCRIPT
+        bash "$f"; rc=$?; rm -f "$f"; exit $rc
+
+    - name: fmt
+      timeout_ms: 900000
+      cmd: |
+        f=$(mktemp) || exit 1
+        cat > "$f" <<'RH_GATE_SCRIPT'
+        set -euo pipefail
+        if ! command -v cargo >/dev/null 2>&1; then
+          echo "fmt: SKIPPED: cargo is not installed on this host (Rust toolchain, ACP-22); touched crates were not checked"
+          exit 0
+        fi
+        # The candidate commit: HEAD in a clean checkout, else a throwaway
+        # commit of the working tree on top of HEAD (no ref or index changes).
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        if [ -z "$(git status --porcelain --untracked-files=all)" ]; then
+          cand=$(git rev-parse HEAD)
+        else
+          idx="$tmp/index"
+          GIT_INDEX_FILE="$idx" git read-tree HEAD
+          GIT_INDEX_FILE="$idx" git add -A
+          cand=$(git commit-tree -p HEAD -m "rh-gate candidate" "$(GIT_INDEX_FILE="$idx" git write-tree)")
+        fi
+        base=$(git show "$cand":RH-PATCHES.md | sed -n 's/^Upstream base: *[^ ]* *\([0-9a-f]\{40\}\) *$/\1/p' | head -n1)
+        [ -n "$base" ] || { echo "fmt: FAIL: no 'Upstream base:' commit in RH-PATCHES.md" >&2; exit 1; }
+        command -v jq >/dev/null 2>&1 || { echo "fmt: FAIL: jq is needed to read cargo metadata" >&2; exit 1; }
+        # The packages touched against the upstream base. Cargo lists every
+        # workspace member (crates/, prod/, third_party/, ...); each changed
+        # path, deleted ones included, belongs to the member whose directory
+        # holds it most deeply. Paths stay NUL-delimited end to end.
+        top=$(cd "$(git rev-parse --show-toplevel)" && pwd -P)
+        cargo metadata --no-deps --offline --format-version 1 --manifest-path "$top/Cargo.toml" >"$tmp/metadata"
+        ws=$(jq -j '.workspace_root' "$tmp/metadata")
+        [ "$(cd "$ws" && pwd -P)" = "$top" ] \
+          || { echo "fmt: FAIL: the cargo workspace root '$ws' is not the repository root '$top'" >&2; exit 1; }
+        jq -j '.workspace_root as $r | .packages[]
+          | .name, "\u0000", (.manifest_path | ltrimstr($r + "/") | rtrimstr("Cargo.toml")), "\u0000"' \
+          "$tmp/metadata" >"$tmp/packages"
+        names=(); dirs=()
+        while IFS= read -r -d '' name && IFS= read -r -d '' dir; do
+          names+=("$name"); dirs+=("$dir")
+        done <"$tmp/packages"
+        [ "${#names[@]}" -gt 0 ] || { echo "fmt: FAIL: cargo metadata lists no workspace package" >&2; exit 1; }
+        git diff --name-only --no-renames -z "$base" "$cand" >"$tmp/changed"
+        declare -A touched=()
+        while IFS= read -r -d '' f; do
+          best=-1
+          for i in "${!dirs[@]}"; do
+            d=${dirs[$i]}
+            if [[ "$f" == "$d"* ]] && { [ "$best" -lt 0 ] || [ "${#d}" -gt "${#dirs[$best]}" ]; }; then best=$i; fi
+          done
+          if [ "$best" -ge 0 ]; then
+            touched["${names[$best]}"]=1
+          elif [[ "$f" == *.rs ]] && [ -e "$f" ]; then
+            echo "fmt: not in a workspace package, not checked: $(printf '%q' "$f")"
+          fi
+        done <"$tmp/changed"
+        if [ "${#touched[@]}" -eq 0 ]; then
+          echo "fmt: no workspace package touched against upstream $base"
+          exit 0
+        fi
+        args=()
+        while IFS= read -r p; do args+=(-p "$p"); done < <(printf '%s\n' "${!touched[@]}" | sort)
+        echo "fmt: cargo fmt --check ${args[*]}"
+        cargo fmt --check "${args[@]}"
+        RH_GATE_SCRIPT
+        bash "$f"; rc=$?; rm -f "$f"; exit $rc
